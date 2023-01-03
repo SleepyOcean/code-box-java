@@ -1,4 +1,4 @@
-package com.sleepyocean.exercise;
+package com.sleepyocean.exercise.simple;
 
 import java.util.*;
 
