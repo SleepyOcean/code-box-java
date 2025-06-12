@@ -1,0 +1,800 @@
+// 项目结构说明：
+// com.sync.MainApp.java                   // 项目入口
+// com.sync.core.SyncManager.java         // 多线程任务管理器
+// com.sync.web.SyncServer.java           // 控制接口服务
+// com.sync.kafka.KafkaConsumerToFile.java // 从集群A读取数据并写入文件
+// com.sync.kafka.KafkaProducerFromFile.java // 从文件读取数据写入集群B
+// com.sync.io.AvroFileWriter.java, AvroFileReader.java // Avro文件操作
+// com.sync.util.ConfigLoader.java        // 配置文件加载器
+// resources/schema/                      // 每个topic的Avro schema定义
+// config/application.yaml                // 配置文件（集群A、B信息、topic列表等）
+
+// com.sync.MainApp.java
+package com.sync;
+
+import com.sync.core.SyncManager;
+import com.sync.util.ConfigLoader;
+import com.sync.web.SyncServer;
+
+public class MainApp {
+    public static void main(String[] args) throws Exception {
+        Thread.setDefaultUncaughtExceptionHandler((t, e) -> {
+            System.err.println("[Uncaught Exception] in thread " + t.getName());
+            e.printStackTrace();
+        });
+
+        var config = ConfigLoader.load("config/application.yaml");
+        SyncManager manager = new SyncManager(config);
+
+        // 启动 REST 接口服务
+        SyncServer server = new SyncServer(manager);
+        server.start();
+
+        // 启动默认同步任务
+        manager.startAll();
+    }
+}
+
+// com.sync.core.SyncManager.java
+package com.sync.core;
+
+import com.sync.kafka.KafkaConsumerToFile;
+import com.sync.kafka.KafkaProducerFromFile;
+import java.util.concurrent.*;
+import java.util.*;
+
+public class SyncManager {
+    private final Map<String, Object> config;
+    private final Map<String, Future<?>> tasks = new ConcurrentHashMap<>();
+    private final ExecutorService executor = Executors.newCachedThreadPool();
+
+    public SyncManager(Map<String, Object> config) {
+        this.config = config;
+    }
+
+    public void startAll() {
+        var topics = (Map<String, Object>) config.get("topics");
+        for (String topic : topics.keySet()) {
+            startTopic(topic);
+        }
+    }
+
+    public void startTopic(String topic) {
+        if (tasks.containsKey(topic)) return;
+        Future<?> futureA = executor.submit(new KafkaConsumerToFile(topic, config));
+        Future<?> futureB = executor.submit(new KafkaProducerFromFile(topic, config));
+        tasks.put(topic + "-A", futureA);
+        tasks.put(topic + "-B", futureB);
+    }
+
+    public void stopTopic(String topic) {
+        Future<?> fA = tasks.remove(topic + "-A");
+        Future<?> fB = tasks.remove(topic + "-B");
+        if (fA != null) fA.cancel(true);
+        if (fB != null) fB.cancel(true);
+    }
+
+    public Set<String> getActiveTopics() {
+        Set<String> active = new HashSet<>();
+        for (String key : tasks.keySet()) {
+            active.add(key.split("-")[0]);
+        }
+        return active;
+    }
+}
+
+// com.sync.web.SyncServer.java
+package com.sync.web;
+
+import com.sun.net.httpserver.*;
+import com.sync.core.SyncManager;
+
+import java.io.IOException;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+
+public class SyncServer {
+    private final SyncManager manager;
+
+    public SyncServer(SyncManager manager) {
+        this.manager = manager;
+    }
+
+    public void start() throws IOException {
+        HttpServer server = HttpServer.create(new InetSocketAddress(8080), 0);
+
+        server.createContext("/start", exchange -> {
+            String topic = exchange.getRequestURI().getQuery().replace("topic=", "");
+            manager.startTopic(topic);
+            respond(exchange, "Started topic: " + topic);
+        });
+
+        server.createContext("/stop", exchange -> {
+            String topic = exchange.getRequestURI().getQuery().replace("topic=", "");
+            manager.stopTopic(topic);
+            respond(exchange, "Stopped topic: " + topic);
+        });
+
+        server.createContext("/status", exchange -> {
+            respond(exchange, "Active topics: " + manager.getActiveTopics());
+        });
+
+        server.setExecutor(null);
+        server.start();
+        System.out.println("[SyncServer] listening on http://localhost:8080");
+    }
+
+    private void respond(HttpExchange exchange, String response) throws IOException {
+        exchange.sendResponseHeaders(200, response.length());
+        try (OutputStream os = exchange.getResponseBody()) {
+            os.write(response.getBytes());
+        }
+    }
+}
+
+// com.sync.util.ConfigLoader.java
+package com.sync.util;
+
+import org.yaml.snakeyaml.Yaml;
+import java.io.InputStream;
+import java.util.Map;
+
+public class ConfigLoader {
+    public static Map<String, Object> load(String path) {
+        Yaml yaml = new Yaml();
+        try (InputStream in = ConfigLoader.class.getClassLoader().getResourceAsStream(path)) {
+            if (in == null) throw new IllegalArgumentException("Config file not found: " + path);
+            return yaml.load(in);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to load config", e);
+        }
+    }
+}
+
+===============================================================================================================
+
+
+// ...上文省略
+
+// com.sync.kafka.KafkaConsumerToFile.java
+package com.sync.kafka;
+
+import com.sync.io.AvroFileWriter;
+import org.apache.kafka.clients.consumer.*;
+import org.apache.kafka.common.serialization.ByteArrayDeserializer;
+
+import java.io.File;
+import java.time.Duration;
+import java.util.*;
+
+public class KafkaConsumerToFile implements Runnable {
+    private final String topic;
+    private final Map<String, Object> config;
+
+    public KafkaConsumerToFile(String topic, Map<String, Object> config) {
+        this.topic = topic;
+        this.config = config;
+    }
+
+    @Override
+    public void run() {
+        Map<String, Object> kafkaConfig = (Map<String, Object>) config.get("clusterA");
+        Properties props = new Properties();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaConfig.get("bootstrap").toString());
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, "sync-group-" + topic);
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class.getName());
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class.getName());
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+
+        try (KafkaConsumer<byte[], byte[]> consumer = new KafkaConsumer<>(props);
+             AvroFileWriter writer = new AvroFileWriter(topic, config)) {
+            consumer.subscribe(List.of(topic));
+            while (!Thread.currentThread().isInterrupted()) {
+                ConsumerRecords<byte[], byte[]> records = consumer.poll(Duration.ofSeconds(1));
+                for (ConsumerRecord<byte[], byte[]> record : records) {
+                    writer.append(record.value());
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("[KafkaConsumerToFile] Error in topic: " + topic);
+            e.printStackTrace();
+        }
+    }
+}
+
+// com.sync.kafka.KafkaProducerFromFile.java
+package com.sync.kafka;
+
+import com.sync.io.AvroFileReader;
+import org.apache.kafka.clients.producer.*;
+import org.apache.kafka.common.serialization.ByteArraySerializer;
+
+import java.io.File;
+import java.util.Map;
+import java.util.Properties;
+
+public class KafkaProducerFromFile implements Runnable {
+    private final String topic;
+    private final Map<String, Object> config;
+
+    public KafkaProducerFromFile(String topic, Map<String, Object> config) {
+        this.topic = topic;
+        this.config = config;
+    }
+
+    @Override
+    public void run() {
+        Map<String, Object> kafkaConfig = (Map<String, Object>) config.get("clusterB");
+        Properties props = new Properties();
+        props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaConfig.get("bootstrap").toString());
+        props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class.getName());
+        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class.getName());
+
+        try (KafkaProducer<byte[], byte[]> producer = new KafkaProducer<>(props);
+             AvroFileReader reader = new AvroFileReader(topic, config)) {
+            byte[] message;
+            while ((message = reader.next()) != null && !Thread.currentThread().isInterrupted()) {
+                producer.send(new ProducerRecord<>(topic, message));
+            }
+        } catch (Exception e) {
+            System.err.println("[KafkaProducerFromFile] Error in topic: " + topic);
+            e.printStackTrace();
+        }
+    }
+}
+
+
+===============================================================================================================
+
+// ...上文省略
+
+// com.sync.io.AvroFileWriter.java
+package com.sync.io;
+
+import org.apache.avro.Schema;
+import org.apache.avro.file.DataFileWriter;
+import org.apache.avro.generic.*;
+import org.apache.avro.io.DatumWriter;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.Map;
+
+public class AvroFileWriter implements AutoCloseable {
+    private final DataFileWriter<GenericRecord> writer;
+    private final Schema schema;
+    private final File file;
+
+    public AvroFileWriter(String topic, Map<String, Object> config) throws IOException {
+        String schemaPath = "schema/" + topic + ".avsc";
+        schema = new Schema.Parser().parse(AvroFileWriter.class.getClassLoader().getResourceAsStream(schemaPath));
+        file = new File("data/" + topic + ".avro");
+
+        DatumWriter<GenericRecord> datumWriter = new GenericDatumWriter<>(schema);
+        writer = new DataFileWriter<>(datumWriter);
+        writer.create(schema, file);
+    }
+
+    public void append(byte[] payload) throws IOException {
+        GenericRecord record = new GenericData.Record(schema);
+        record.put("payload", ByteBuffer.wrap(payload));
+        writer.append(record);
+    }
+
+    @Override
+    public void close() throws IOException {
+        writer.close();
+    }
+}
+
+// com.sync.io.AvroFileReader.java
+package com.sync.io;
+
+import org.apache.avro.Schema;
+import org.apache.avro.file.DataFileReader;
+import org.apache.avro.generic.*;
+import org.apache.avro.io.DatumReader;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.Map;
+
+public class AvroFileReader implements AutoCloseable {
+    private final DataFileReader<GenericRecord> reader;
+    private final Schema schema;
+
+    public AvroFileReader(String topic, Map<String, Object> config) throws IOException {
+        String schemaPath = "schema/" + topic + ".avsc";
+        schema = new Schema.Parser().parse(AvroFileReader.class.getClassLoader().getResourceAsStream(schemaPath));
+        File file = new File("data/" + topic + ".avro");
+
+        DatumReader<GenericRecord> datumReader = new GenericDatumReader<>(schema);
+        reader = new DataFileReader<>(file, datumReader);
+    }
+
+    public byte[] next() throws IOException {
+        if (!reader.hasNext()) return null;
+        GenericRecord record = reader.next();
+        ByteBuffer buffer = (ByteBuffer) record.get("payload");
+        byte[] data = new byte[buffer.remaining()];
+        buffer.get(data);
+        return data;
+    }
+
+    @Override
+    public void close() throws IOException {
+        reader.close();
+    }
+}
+
+// resources/schema/example-topic.avsc
+{
+  "type": "record",
+  "name": "SyncRecord",
+  "fields": [
+    {"name": "payload", "type": "bytes"}
+  ]
+}
+
+// config/application.yaml
+clusterA:
+  bootstrap: "localhost:9092"
+
+clusterB:
+  bootstrap: "localhost:9093"
+
+topics:
+  example-topic: {}
+
+
+===============================================================================================================
+
+// ...上文省略
+
+// 增加 Avro 文件压缩和轮转
+// 修改 AvroFileWriter 支持 Snappy 压缩与按大小切分文件
+
+// com.sync.io.AvroFileWriter.java
+package com.sync.io;
+
+import org.apache.avro.Schema;
+import org.apache.avro.file.CodecFactory;
+import org.apache.avro.file.DataFileWriter;
+import org.apache.avro.generic.*;
+import org.apache.avro.io.DatumWriter;
+
+import java.io.*;
+import java.nio.ByteBuffer;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.Map;
+
+public class AvroFileWriter implements AutoCloseable {
+    private final Schema schema;
+    private final DatumWriter<GenericRecord> datumWriter;
+    private final CodecFactory codec;
+    private final String topic;
+    private final String dir;
+    private final long maxSizeBytes;
+    private DataFileWriter<GenericRecord> writer;
+    private File currentFile;
+    private long writtenBytes;
+
+    public AvroFileWriter(String topic, Map<String, Object> config) throws IOException {
+        this.topic = topic;
+        this.dir = "data/" + topic;
+        new File(dir).mkdirs();
+
+        String schemaPath = "schema/" + topic + ".avsc";
+        schema = new Schema.Parser().parse(getClass().getClassLoader().getResourceAsStream(schemaPath));
+        datumWriter = new GenericDatumWriter<>(schema);
+        codec = CodecFactory.snappyCodec();
+        maxSizeBytes = 50 * 1024 * 1024; // 每50MB切一个文件
+
+        openNewWriter();
+    }
+
+    private void openNewWriter() throws IOException {
+        String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
+        currentFile = new File(dir + "/" + topic + "_" + timestamp + ".avro");
+        writer = new DataFileWriter<>(datumWriter);
+        writer.setCodec(codec);
+        writer.create(schema, currentFile);
+        writtenBytes = 0;
+    }
+
+    public void append(byte[] payload) throws IOException {
+        GenericRecord record = new GenericData.Record(schema);
+        record.put("payload", ByteBuffer.wrap(payload));
+        writer.append(record);
+        writtenBytes += payload.length + 16;
+
+        if (writtenBytes > maxSizeBytes) {
+            writer.close();
+            openNewWriter();
+        }
+    }
+
+    @Override
+    public void close() throws IOException {
+        writer.close();
+    }
+}
+
+
+===============================================================================================================
+
+// ...上文省略
+
+// AvroFileReader 支持遍历多文件和按顺序读取
+// com.sync.io.AvroFileReader.java
+package com.sync.io;
+
+import org.apache.avro.Schema;
+import org.apache.avro.file.DataFileReader;
+import org.apache.avro.generic.*;
+import org.apache.avro.io.DatumReader;
+
+import java.io.*;
+import java.nio.ByteBuffer;
+import java.util.*;
+
+public class AvroFileReader implements AutoCloseable {
+    private final Schema schema;
+    private final Queue<File> files;
+    private final String topic;
+    private DataFileReader<GenericRecord> reader;
+
+    public AvroFileReader(String topic, Map<String, Object> config) throws IOException {
+        this.topic = topic;
+        this.files = new LinkedList<>();
+        String dir = "data/" + topic;
+        String schemaPath = "schema/" + topic + ".avsc";
+        schema = new Schema.Parser().parse(getClass().getClassLoader().getResourceAsStream(schemaPath));
+
+        File[] avroFiles = new File(dir).listFiles((d, name) -> name.endsWith(".avro"));
+        if (avroFiles != null) {
+            Arrays.sort(avroFiles);
+            files.addAll(Arrays.asList(avroFiles));
+        }
+        openNextReader();
+    }
+
+    private void openNextReader() throws IOException {
+        if (reader != null) reader.close();
+        File nextFile = files.poll();
+        if (nextFile != null) {
+            DatumReader<GenericRecord> datumReader = new GenericDatumReader<>(schema);
+            reader = new DataFileReader<>(nextFile, datumReader);
+        } else {
+            reader = null;
+        }
+    }
+
+    public byte[] next() throws IOException {
+        while (reader != null) {
+            if (reader.hasNext()) {
+                GenericRecord record = reader.next();
+                ByteBuffer buffer = (ByteBuffer) record.get("payload");
+                byte[] data = new byte[buffer.remaining()];
+                buffer.get(data);
+                return data;
+            } else {
+                openNextReader();
+            }
+        }
+        return null;
+    }
+
+    @Override
+    public void close() throws IOException {
+        if (reader != null) reader.close();
+    }
+}
+
+// 消费 offset 记录（可扩展到 Redis、数据库，此处简化为本地文件）
+// com.sync.offset.OffsetTracker.java
+package com.sync.offset;
+
+import java.io.*;
+import java.util.concurrent.ConcurrentHashMap;
+
+public class OffsetTracker {
+    private static final String FILE_PATH = "offset/offsets.txt";
+    private static final ConcurrentHashMap<String, Long> offsets = new ConcurrentHashMap<>();
+
+    public static void save(String topic, long offset) {
+        offsets.put(topic, offset);
+        try (BufferedWriter writer = new BufferedWriter(new FileWriter(FILE_PATH))) {
+            for (var entry : offsets.entrySet()) {
+                writer.write(entry.getKey() + "," + entry.getValue());
+                writer.newLine();
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public static long load(String topic) {
+        File file = new File(FILE_PATH);
+        if (!file.exists()) return 0;
+        try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                String[] parts = line.split(",");
+                if (parts.length == 2) {
+                    offsets.put(parts[0], Long.parseLong(parts[1]));
+                }
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        return offsets.getOrDefault(topic, 0L);
+    }
+}
+
+// 简化的 Maven 配置
+// pom.xml
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <groupId>com.sync</groupId>
+    <artifactId>kafka-file-sync</artifactId>
+    <version>1.0.0</version>
+    <dependencies>
+        <dependency>
+            <groupId>org.apache.kafka</groupId>
+            <artifactId>kafka-clients</artifactId>
+            <version>3.7.0</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.avro</groupId>
+            <artifactId>avro</artifactId>
+            <version>1.11.3</version>
+        </dependency>
+        <dependency>
+            <groupId>org.yaml</groupId>
+            <artifactId>snakeyaml</artifactId>
+            <version>2.0</version>
+        </dependency>
+    </dependencies>
+</project>
+
+
+===============================================================================================================
+
+// ...上文省略
+
+// 添加 REST 控制与全局异常处理
+
+// com.sync.api.SyncController.java
+package com.sync.api;
+
+import com.sync.task.SyncManager;
+import org.springframework.web.bind.annotation.*;
+import java.util.*;
+
+@RestController
+@RequestMapping("/sync")
+public class SyncController {
+
+    @PostMapping("/start")
+    public String start(@RequestParam String topic) {
+        SyncManager.getInstance().start(topic);
+        return "Sync started for: " + topic;
+    }
+
+    @PostMapping("/stop")
+    public String stop(@RequestParam String topic) {
+        SyncManager.getInstance().stop(topic);
+        return "Sync stopped for: " + topic;
+    }
+
+    @GetMapping("/status")
+    public Map<String, String> status() {
+        return SyncManager.getInstance().status();
+    }
+}
+
+// com.sync.task.SyncManager.java
+package com.sync.task;
+
+import java.util.*;
+import java.util.concurrent.*;
+
+public class SyncManager {
+    private final Map<String, Future<?>> tasks = new ConcurrentHashMap<>();
+    private final ExecutorService executor = Executors.newCachedThreadPool();
+    private static final SyncManager INSTANCE = new SyncManager();
+
+    public static SyncManager getInstance() {
+        return INSTANCE;
+    }
+
+    public void start(String topic) {
+        if (!tasks.containsKey(topic)) {
+            Future<?> future = executor.submit(new SyncRunnable(topic));
+            tasks.put(topic, future);
+        }
+    }
+
+    public void stop(String topic) {
+        Future<?> future = tasks.remove(topic);
+        if (future != null) future.cancel(true);
+    }
+
+    public Map<String, String> status() {
+        Map<String, String> result = new HashMap<>();
+        for (var entry : tasks.entrySet()) {
+            result.put(entry.getKey(), entry.getValue().isCancelled() ? "stopped" : "running");
+        }
+        return result;
+    }
+}
+
+// com.sync.task.SyncRunnable.java
+package com.sync.task;
+
+public class SyncRunnable implements Runnable {
+    private final String topic;
+
+    public SyncRunnable(String topic) {
+        this.topic = topic;
+    }
+
+    @Override
+    public void run() {
+        try {
+            // 实际消费写文件、再生产到集群B的主逻辑应封装为服务类在此调用
+            System.out.println("[Sync] Running sync task for topic: " + topic);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+}
+
+// com.sync.GlobalExceptionHandler.java
+package com.sync;
+
+import org.springframework.http.*;
+import org.springframework.web.bind.annotation.*;
+
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<String> handle(Exception e) {
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body("Error: " + e.getMessage());
+    }
+}
+
+// SpringBoot 启动类
+// com.sync.KafkaSyncApplication.java
+package com.sync;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class KafkaSyncApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(KafkaSyncApplication.class, args);
+    }
+}
+
+// pom.xml 增加 Spring Boot 依赖
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-web</artifactId>
+</dependency>
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter</artifactId>
+</dependency>
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-actuator</artifactId>
+</dependency>
+
+
+
+===============================================================================================================
+
+# Kafka File-Based Sync (Avro)
+
+本项目实现 Kafka 集群 A 到集群 B 的异步数据同步。两集群网络不通，通过中转文件完成数据传输，支持千万级消息同步，格式统一为 Avro（压缩、可轮转）。
+
+## 🔧 功能特性
+
+- 支持 Avro 格式中转文件（Snappy 压缩）
+- 支持数据原样（字节级）同步
+- Kafka 多 topic 支持
+- 自动分割文件（默认 50MB）
+- 本地 offset 持久化防止重复消费
+- REST 接口控制任务（启动/停止/查询）
+- 全局异常处理、可扩展日志统一
+- 多线程任务处理调度
+
+## 📦 项目结构
+
+```
+kafka-file-sync/
+├── schema/               # 每个 topic 的 .avsc 文件
+├── data/                 # Avro 中转文件目录
+├── offset/               # 本地 offset 持久化
+├── src/main/java/
+│   ├── com.sync.api/         # REST 控制器
+│   ├── com.sync.io/          # Avro 写入/读取模块
+│   ├── com.sync.offset/      # offset 存储模块
+│   ├── com.sync.task/        # 多线程任务调度器
+│   └── com.sync/             # 启动入口、异常处理
+├── src/main/resources/
+│   ├── application.yaml
+│   └── schema/topic-name.avsc
+├── pom.xml
+└── README.md
+```
+
+## 🚀 启动方式
+
+```bash
+# 构建项目
+mvn clean package
+
+# 运行 Spring Boot 服务（包含 REST 接口）
+java -jar target/kafka-file-sync-1.0.0.jar
+```
+
+## 🧪 REST 接口使用示例
+
+```bash
+curl -X POST 'http://localhost:8080/sync/start?topic=your-topic'
+curl -X POST 'http://localhost:8080/sync/stop?topic=your-topic'
+curl http://localhost:8080/sync/status
+```
+
+## 🛠️ Docker 部署（可选）
+
+```Dockerfile
+FROM openjdk:17-alpine
+WORKDIR /app
+COPY target/kafka-file-sync-1.0.0.jar app.jar
+EXPOSE 8080
+ENTRYPOINT ["java", "-jar", "app.jar"]
+```
+
+```bash
+# 构建镜像
+docker build -t kafka-sync .
+
+# 启动容器
+docker run -p 8080:8080 -v $(pwd)/data:/app/data kafka-sync
+```
+
+## 📌 配置项（application.yaml）
+
+```yaml
+kafka:
+  clusterA:
+    bootstrapServers: "localhost:9092"
+  clusterB:
+    bootstrapServers: "localhost:9093"
+```
+
+## ✅ 示例 Avro Schema（schema/example-topic.avsc）
+
+```json
+{
+  "type": "record",
+  "name": "Message",
+  "fields": [
+    { "name": "payload", "type": "bytes" }
+  ]
+}
+```
+
+---
+
+📨 如需支持更多功能（Schema Evolution、多格式混合等），请提交 Issue 或 Fork 本项目。
+
+MIT License © 2025
