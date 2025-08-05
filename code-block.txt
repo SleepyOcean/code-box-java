@@ -842,8 +842,79 @@ while true; do
     sleep 30
 done
 
+-------------------
 
 
+#!/bin/bash
+
+# Configuration
+source_dir="./source"      # Source directory (modify as needed)
+target_dir="./target"      # Target directory (modify as needed)
+log_dir="./logs"           # Log directory (modify as needed)
+scheduled_times=("11:00" "13:00" "15:00" "16:00")  # Scheduled times (HH:MM format)
+
+# Validate input features
+if [ $# -eq 0 ]; then
+    echo "Error: At least one filename feature required" >&2
+    exit 1
+fi
+
+# Create directories if missing
+mkdir -p "$source_dir" "$target_dir" "$log_dir"
+
+# Initialize execution tracker
+declare -A executed_map
+last_reset_date=$(date +"%Y%m%d")
+
+# Main scheduler loop
+while true; do
+    current_date=$(date +"%Y%m%d")
+    current_time=$(date +"%H:%M")
+    
+    # Reset execution flags daily
+    if [ "$current_date" != "$last_reset_date" ]; then
+        unset executed_map
+        declare -A executed_map
+        last_reset_date="$current_date"
+    fi
+    
+    # Check scheduled times
+    for time_slot in "${scheduled_times[@]}"; do
+        if [ "$current_time" == "$time_slot" ] && [ -z "${executed_map[$time_slot]}" ]; then
+            executed_map[$time_slot]=1
+            
+            # Process all file features
+            for feature in "$@"; do
+                log_file="${log_dir}/copy_${feature}.log"
+                filename="${feature}_${current_date}.txt"
+                source_path="${source_dir}/${filename}"
+                target_path="${target_dir}/${filename}"
+                
+                # Skip if source missing
+                if [ ! -f "$source_path" ]; then
+                    echo "[$(date)] Source missing: $source_path" >> "$log_file"
+                    continue
+                fi
+                
+                # Skip if target exists
+                if [ -f "$target_path" ]; then
+                    echo "[$(date)] Target exists: $target_path" >> "$log_file"
+                    continue
+                fi
+                
+                # Copy file with error handling
+                if cp "$source_path" "$target_path" 2>/dev/null; then
+                    echo "[$(date)] Copied: $source_path -> $target_path" >> "$log_file"
+                else
+                    echo "[$(date)] Copy failed: $source_path" >> "$log_file"
+                fi
+            done
+        fi
+    done
+    
+    # Sleep until next minute
+    sleep $((60 - $(date +%S)))
+done
 
 
 
