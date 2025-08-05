@@ -798,3 +798,55 @@ kafka:
 📨 如需支持更多功能（Schema Evolution、多格式混合等），请提交 Issue 或 Fork 本项目。
 
 MIT License © 2025
+
+
+-----------
+
+
+#!/bin/bash
+# 纯 Bash 实现：每天 11、13、15、16 点整点触发拷贝
+# 不依赖 crontab、systemd、at 等任何外部定时工具
+
+########### 用户可修改的部分 ###########
+SRC_DIR="/source/dir"          # 源目录
+DEST_BASE="/backup/dir"        # 备份根目录
+LOG_FILE="/tmp/pure_copy.log"  # 日志
+########################################
+
+# 任务函数：执行拷贝
+do_copy() {
+    local today_str=$(date +%F)          # 2025-08-05
+    local dest_dir="${DEST_BASE}/${today_str}"
+    mkdir -p "$dest_dir"
+
+    # 查找并复制
+    for f in "$SRC_DIR"/*"$today_str"*; do
+        [ -e "$f" ] || continue          # 无匹配时跳过
+        cp -n "$f" "$dest_dir/"
+    done
+
+    echo "[$(date '+%F %T')] 已拷贝到 $dest_dir" >> "$LOG_FILE"
+}
+
+# 无限循环
+while true; do
+    now=$(date +%H:%M)
+    case "$now" in
+        11:00|13:00|15:00|16:00)
+            do_copy
+            # 防止同一分钟内重复触发
+            sleep 70
+            ;;
+    esac
+    # 每 30 秒检查一次时间
+    sleep 30
+done
+
+
+
+
+
+
+
+
+
