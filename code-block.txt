@@ -1,3 +1,45 @@
+@RestController
+@RequestMapping("/stream")
+public class StreamController {
+
+    /**
+     * POST /stream/echo
+     * curl -N -X POST http://localhost:8080/stream/echo \
+     *      -d "msg=hello" -d "times=10" -d "interval=500"
+     */
+    @PostMapping(value = "/echo", produces = MediaType.TEXT_PLAIN_VALUE)
+    public StreamingResponseBody echo(@RequestParam Map<String, String> params,
+                                      HttpServletRequest request) {
+        final String msg      = params.getOrDefault("msg", "tick");
+        final int    times    = Integer.parseInt(params.getOrDefault("times", "5"));
+        final long   interval = Long.parseLong(params.getOrDefault("interval", "1000"));
+
+        return outputStream -> {
+            try (PrintWriter writer = new PrintWriter(new OutputStreamWriter(outputStream, StandardCharsets.UTF_8))) {
+                for (int i = 1; i <= times; i++) {
+                    // 1) 客户端断开检测
+                    if (request.getInputStream().isFinished()) {
+                        writer.println("client disconnected, stop");
+                        writer.flush();
+                        return;
+                    }
+
+                    // 2) 业务逻辑
+                    writer.println(msg + "-" + i);
+                    writer.flush();          // 关键：实时推送
+                    Thread.sleep(interval);
+                }
+                writer.println("done");
+                writer.flush();
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+        };
+    }
+}
+
+==================================================
+
 // 项目结构说明：
 // com.sync.MainApp.java                   // 项目入口
 // com.sync.core.SyncManager.java         // 多线程任务管理器
