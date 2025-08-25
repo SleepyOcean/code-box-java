@@ -1,3 +1,46 @@
+import java.util.regex.Pattern;
+
+public class WildcardMatcher {
+
+    /**
+     * 判断是否匹配（支持 % 通配符）
+     * @param text       原始字符串
+     * @param pattern    含 % 的模式串
+     * @param ignoreCase 是否忽略大小写
+     * @return           是否匹配
+     */
+    public static boolean contains(String text, String pattern, boolean ignoreCase) {
+        if (text == null || pattern == null) {
+            return false;
+        }
+
+        // 1. 将 % 转成正则的 .* ，其余正则符号转义
+        String regex = pattern
+                .replace("\\", "\\\\") // 先处理反斜杠
+                .replace(".", "\\.")
+                .replace("?", "\\?")
+                .replace("*", "\\*")
+                .replace("%", ".*");
+
+        // 2. 编译正则
+        int flags = ignoreCase ? Pattern.CASE_INSENSITIVE : 0;
+        return Pattern.compile(regex, flags)
+                      .matcher(text)
+                      .find();          // 只要在 text 中出现过即可
+    }
+
+    // 演示
+    public static void main(String[] args) {
+        System.out.println(contains("HelloWorld", "H%o", true));   // true
+        System.out.println(contains("HelloWorld", "h%O", true));   // true
+        System.out.println(contains("HelloWorld", "h%O", false));  // false
+        System.out.println(contains("HelloWorld", "abc%xyz", true)); // false
+    }
+}
+
+=======================================================================================
+
+
 @RestController
 @RequestMapping("/stream")
 public class StreamController {
